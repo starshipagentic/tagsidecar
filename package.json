@@ -1,0 +1,33 @@
+{
+  "name": "tagsidecar",
+  "version": "1.0.0",
+  "description": "Sidecar metadata file management for developers who work in frenzies",
+  "main": "tagsidecar.js",
+  "bin": {
+    "tagsidecar": "./tagsidecar.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "metadata",
+    "tagging",
+    "sidecar",
+    "developer-tools",
+    "knowledge-management",
+    "terminal-sessions",
+    "project-management",
+    "documentation"
+  ],
+  "author": "starshipagentic",
+  "license": "MIT",
+  "type": "commonjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/starshipagentic/tagsidecar.git"
+  },
+  "dependencies": {
+    "commander": "^14.0.1",
+    "gray-matter": "^4.0.3"
+  }
+}
