@@ -49,6 +49,25 @@ function getCurrentStardate() {
 }
 
 // ============================================================================
+// NOTE COMMAND (shared by all file types)
+// ============================================================================
+
+function addNote(filePath, text, options) {
+  const parsed = readMetadataFile(filePath);
+
+  if (!parsed) {
+    console.error(`✗ File not found: ${path.basename(filePath)}`);
+    process.exit(1);
+  }
+
+  const timestamp = options.skipTimestamp ? '' : `## ${getCurrentDate()}\n\n`;
+  const newMarkdown = parsed.content + timestamp + text + '\n\n';
+
+  writeMetadataFile(filePath, parsed.data, newMarkdown);
+  console.log(`✓ Added note to ${path.basename(filePath)}`);
+}
+
+// ============================================================================
 // SHIP COMMANDS
 // ============================================================================
 
@@ -71,10 +90,14 @@ function shipInit(options) {
     commands: {}
   };
 
-  const markdown = `# ${data.shipname}\n\n${data.purpose}\n\n## Getting Started\n\nAdd your documentation here.\n`;
+  const markdown = `# ${data.shipname}\n\nMarkdown area below\n\n`;
 
   writeMetadataFile(shipPath, data, markdown);
   console.log(`✓ Created ${SHIP_FILE}`);
+}
+
+function shipNote(text, options) {
+  addNote(path.join(process.cwd(), SHIP_FILE), text, options);
 }
 
 function shipAddTag(tags, options) {
@@ -250,6 +273,10 @@ function captainslogAdd(title, options) {
   console.log(`  Impact: ${impact}, Type: ${type}`);
 }
 
+function captainslogNote(text, options) {
+  addNote(path.join(process.cwd(), CAPTAINSLOG_FILE), text, options);
+}
+
 // ============================================================================
 // TERMINAL COMMANDS
 // ============================================================================
@@ -353,6 +380,10 @@ function terminalRestore() {
 
   console.log('Note: Automatic terminal opening not yet implemented.');
   console.log('Use the commands above to manually restore your session.');
+}
+
+function terminalNote(text, options) {
+  addNote(path.join(process.cwd(), TERMINAL_FILE), text, options);
 }
 
 // ============================================================================
@@ -489,12 +520,15 @@ module.exports = {
   shipRemoveTag,
   shipFleetAdd,
   shipShow,
+  shipNote,
   captainslogInit,
   captainslogAdd,
+  captainslogNote,
   terminalInit,
   terminalAdd,
   terminalList,
   terminalRestore,
+  terminalNote,
   searchAll,
   discover
 };
@@ -507,7 +541,7 @@ if (require.main === module) {
   program
     .name('tagsidecar')
     .description('Sidecar metadata file management for developers who work in frenzies')
-    .version('1.0.0');
+    .version('1.1.0');
 
   // SHIP COMMANDS
   const ship = program.command('ship').description('Ship metadata operations');
@@ -543,6 +577,12 @@ if (require.main === module) {
     .description('Show ship metadata')
     .action(shipShow);
 
+  ship
+    .command('note <text>')
+    .description('Append note to ship markdown')
+    .option('--skip-timestamp', 'Skip automatic timestamp heading')
+    .action(shipNote);
+
   // CAPTAINSLOG COMMANDS
   const captainslog = program.command('captainslog').description('Captain\'s log operations');
 
@@ -560,6 +600,12 @@ if (require.main === module) {
     .option('--content <text>', 'Entry content')
     .option('--topics <topics>', 'Comma-separated topics')
     .action(captainslogAdd);
+
+  captainslog
+    .command('note <text>')
+    .description('Append note to captain\'s log markdown')
+    .option('--skip-timestamp', 'Skip automatic timestamp heading')
+    .action(captainslogNote);
 
   // TERMINAL COMMANDS
   const terminal = program.command('terminal').description('Terminal session operations');
@@ -589,6 +635,12 @@ if (require.main === module) {
     .command('restore')
     .description('Restore terminal session')
     .action(terminalRestore);
+
+  terminal
+    .command('note <text>')
+    .description('Append note to terminal markdown')
+    .option('--skip-timestamp', 'Skip automatic timestamp heading')
+    .action(terminalNote);
 
   // CONVENIENCE COMMANDS (shortcuts)
   program

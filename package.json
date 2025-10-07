@@ -1,6 +1,6 @@
 {
   "name": "tagsidecar",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Sidecar metadata file management for developers who work in frenzies",
   "main": "tagsidecar.js",
   "bin": {
