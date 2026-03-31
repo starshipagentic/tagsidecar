@@ -277,6 +277,121 @@ function captainslogNote(text, options) {
   addNote(path.join(process.cwd(), CAPTAINSLOG_FILE), text, options);
 }
 
+
+function captainslogActive(options) {
+  const searchPath = options.path || process.cwd();
+  const days = parseInt(options.days || '30', 10);
+  const jsonOutput = options.json || false;
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  try {
+    // Find all captainslog files
+    const rgCommand = `find "${searchPath}" -name "${CAPTAINSLOG_FILE}" -type f 2>/dev/null`;
+    const output = execSync(rgCommand, { encoding: 'utf8' });
+    const files = output.trim().split('\n').filter(Boolean);
+
+    const active = [];
+
+    files.forEach(file => {
+      const parsed = readMetadataFile(file);
+      if (!parsed || !parsed.data.entries) return;
+
+      const entries = ensureArray(parsed.data.entries);
+      const recent = entries.filter(e => e.date && e.date >= cutoffStr);
+
+      if (recent.length > 0) {
+        const relPath = path.relative(searchPath, path.dirname(file));
+        const latest = recent[0];
+        active.push({
+          repo: relPath || path.basename(path.dirname(file)),
+          ship: parsed.data.ship || path.basename(path.dirname(file)),
+          entries_recent: recent.length,
+          entries_total: entries.length,
+          last_date: latest.date,
+          last_title: latest.title || '',
+          last_impact: latest.impact || '',
+          last_type: latest.type || '',
+          topics: ensureArray(parsed.data.topics).slice(0, 10),
+        });
+      }
+    });
+
+    active.sort((a, b) => (b.last_date || '').localeCompare(a.last_date || ''));
+
+    if (jsonOutput) {
+      console.log(JSON.stringify({ days, active_repos: active.length, repos: active }, null, 2));
+      return;
+    }
+
+    if (active.length === 0) {
+      console.log(`No captain's log activity in the last ${days} days.`);
+      return;
+    }
+
+    console.log(`\nActive projects (last ${days} days): ${active.length}\n`);
+    active.forEach(r => {
+      const marker = r.last_impact === 'high' ? '★' : ' ';
+      console.log(`${marker} ${r.ship}`);
+      console.log(`  Last: ${r.last_date} — ${r.last_title}`);
+      console.log(`  Entries: ${r.entries_recent} recent / ${r.entries_total} total`);
+      if (r.topics.length > 0) {
+        console.log(`  Topics: ${r.topics.join(', ')}`);
+      }
+      console.log('');
+    });
+
+  } catch (error) {
+    console.error('Error scanning logs:', error.message);
+    process.exit(1);
+  }
+}
+
+
+function captainslogContext(options) {
+  const jsonOutput = options.json || false;
+  const logPath = path.join(process.cwd(), CAPTAINSLOG_FILE);
+  const parsed = readMetadataFile(logPath);
+
+  if (!parsed) {
+    console.error(`No captain's log in ${process.cwd()}`);
+    console.error(`Run: tagsidecar captainslog init`);
+    process.exit(1);
+  }
+
+  const entries = ensureArray(parsed.data.entries);
+  const recent = entries.slice(0, 5);
+  const topics = ensureArray(parsed.data.topics).slice(0, 20);
+
+  const result = {
+    project: parsed.data.ship || path.basename(process.cwd()),
+    directory: process.cwd(),
+    topics,
+    total_entries: entries.length,
+    recent_entries: recent,
+  };
+
+  if (jsonOutput) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  console.log(`\n${result.project}`);
+  console.log(`${result.directory}\n`);
+  if (topics.length > 0) {
+    console.log(`Topics: ${topics.join(', ')}\n`);
+  }
+  console.log(`Entries: ${result.total_entries} total\n`);
+  recent.forEach(e => {
+    const marker = e.impact === 'high' ? '★' : ' ';
+    console.log(`${marker} ${e.date || ''} ${e.title || ''}`);
+  });
+  console.log('');
+}
+
+
 // ============================================================================
 // TERMINAL COMMANDS
 // ============================================================================
@@ -524,6 +639,8 @@ module.exports = {
   captainslogInit,
   captainslogAdd,
   captainslogNote,
+  captainslogActive,
+  captainslogContext,
   terminalInit,
   terminalAdd,
   terminalList,
@@ -606,6 +723,20 @@ if (require.main === module) {
     .description('Append note to captain\'s log markdown')
     .option('--skip-timestamp', 'Skip automatic timestamp heading')
     .action(captainslogNote);
+
+  captainslog
+    .command('active')
+    .description('Show repos with recent captain\'s log activity')
+    .option('-p, --path <path>', 'Search path (default: current directory)')
+    .option('-d, --days <days>', 'Look back this many days (default: 30)')
+    .option('--json', 'Output as JSON for programmatic use')
+    .action(captainslogActive);
+
+  captainslog
+    .command('context')
+    .description('What\'s going on in this project — ship, topics, recent entries')
+    .option('--json', 'Output as JSON for programmatic use')
+    .action(captainslogContext);
 
   // TERMINAL COMMANDS
   const terminal = program.command('terminal').description('Terminal session operations');
