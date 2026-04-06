@@ -15,6 +15,83 @@ const SHIP_FILE = '∑ship.md';
 const TERMINAL_FILE = '∫terminal.md';
 const CAPTAINSLOG_FILE = '∆captainslog.md';
 
+// Directories to skip when scanning ~ (--scope all)
+const SKIP_DIRS = [
+  'Library', '.Trash', 'node_modules', '.git', 'venv', '.venv',
+  '__pycache__', '.cache', '.npm', '.nvm', '.pyenv', '.cargo',
+  'Applications', 'Music', 'Movies', 'Pictures', 'Photos',
+  '.local/share', '.docker', 'go/pkg', 'OrbStack',
+];
+
+/**
+ * Score a repo entry for dedup. Higher = preferred copy.
+ * Factors: recency (days since last entry) and path depth (shallower = more local).
+ */
+function _dedupScore(repo, searchPath) {
+  let score = 0;
+
+  // Recency: days since last entry (max 365 points, newer = higher)
+  const lastDate = repo.last_date || '1970-01-01';
+  const daysAgo = (Date.now() - new Date(lastDate).getTime()) / 86400000;
+  score += Math.max(0, 365 - daysAgo);
+
+  // Path depth: fewer slashes from searchPath = closer to user's working dirs
+  // A file at ~/dev/project/ scores higher than ~/deep/cache/acct/project/
+  const loc = repo.location || repo.repo || '';
+  const relPath = path.relative(searchPath, loc);
+  const depth = relPath.split(path.sep).length;
+  score += Math.max(0, 20 - depth) * 5;  // up to 100 points for shallow paths
+
+  return score;
+}
+
+/**
+ * Resolve --scope to a search path.
+ *   "here"  = just cwd (no recursion — handled by caller)
+ *   "tree"  = cwd, recurse into subdirs (default)
+ *   "all"   = home dir, recurse with exclusions
+ * --path overrides --scope entirely.
+ */
+function resolveSearchPath(options) {
+  if (options.path) return { searchPath: options.path, scope: 'tree' };
+  const scope = (options.scope || 'tree').toLowerCase();
+  switch (scope) {
+    case 'here': return { searchPath: process.cwd(), scope: 'here' };
+    case 'all':  return { searchPath: os.homedir(), scope: 'all' };
+    case 'tree':
+    default:     return { searchPath: process.cwd(), scope: 'tree' };
+  }
+}
+
+/**
+ * Find all files matching a filename under searchPath using rg --files.
+ * Respects scope for exclusions and depth.
+ */
+function findFiles(filename, searchPath, scope) {
+  const { spawnSync } = require('child_process');
+  const args = ['--files', '-g', filename];
+
+  if (scope === 'here') {
+    args.push('--max-depth', '1');
+  }
+
+  if (scope === 'all') {
+    // Include hidden dirs like .starforge/harvest-cache
+    args.push('--hidden');
+    for (const dir of SKIP_DIRS) {
+      args.push('-g', `!${dir}`);
+    }
+  }
+
+  args.push(searchPath);
+
+  const result = spawnSync('rg', args, { encoding: 'utf8', timeout: 10000 });
+  if (result.stdout) {
+    return result.stdout.trim().split('\n').filter(Boolean);
+  }
+  return [];
+}
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
@@ -279,7 +356,7 @@ function captainslogNote(text, options) {
 
 
 function captainslogActive(options) {
-  const searchPath = options.path || process.cwd();
+  const { searchPath, scope } = resolveSearchPath(options);
   const days = parseInt(options.days || '30', 10);
   const jsonOutput = options.json || false;
 
@@ -288,38 +365,94 @@ function captainslogActive(options) {
   const cutoffStr = cutoff.toISOString().slice(0, 10);
 
   try {
-    // Find all captainslog files
-    const rgCommand = `find "${searchPath}" -name "${CAPTAINSLOG_FILE}" -type f 2>/dev/null`;
-    const output = execSync(rgCommand, { encoding: 'utf8' });
-    const files = output.trim().split('\n').filter(Boolean);
+    const files = findFiles(CAPTAINSLOG_FILE, searchPath, scope);
 
     const active = [];
+
+    const tagFilter = options.tag ? options.tag.toLowerCase().split(',').map(t => t.trim()) : null;
 
     files.forEach(file => {
       const parsed = readMetadataFile(file);
       if (!parsed || !parsed.data.entries) return;
+
+      // Read ∑ship.md in the same directory for tags
+      const dir = path.dirname(file);
+      const shipFile = path.join(dir, SHIP_FILE);
+      const shipData = readMetadataFile(shipFile);
+      const tags = shipData ? ensureArray(shipData.data.tags) : [];
+
+      // Filter by tag if requested
+      if (tagFilter) {
+        const tagsLower = tags.map(t => t.toLowerCase());
+        const hasTag = tagFilter.some(t => tagsLower.includes(t));
+        if (!hasTag) return;
+      }
 
       const entries = ensureArray(parsed.data.entries);
       const recent = entries.filter(e => e.date && e.date >= cutoffStr);
 
       if (recent.length > 0) {
         const relPath = path.relative(searchPath, path.dirname(file));
-        const latest = recent[0];
+        const detail = parseInt(options.detail || '1', 10);
+        const showLocations = options.locations || false;
+        const topEntries = recent.slice(0, detail).map(e => ({
+          date: e.date,
+          type: e.type || '',
+          impact: e.impact || '',
+          title: e.title || '',
+        }));
         active.push({
           repo: relPath || path.basename(path.dirname(file)),
           ship: parsed.data.ship || path.basename(path.dirname(file)),
+          location: showLocations ? file : undefined,
+          tags: tags.length > 0 ? tags : undefined,
           entries_recent: recent.length,
           entries_total: entries.length,
-          last_date: latest.date,
-          last_title: latest.title || '',
-          last_impact: latest.impact || '',
-          last_type: latest.type || '',
+          last_date: recent[0].date,
+          last_title: recent[0].title || '',
+          last_impact: recent[0].impact || '',
+          last_type: recent[0].type || '',
           topics: ensureArray(parsed.data.topics).slice(0, 10),
+          entries: detail > 1 ? topEntries : undefined,
         });
       }
     });
 
     active.sort((a, b) => (b.last_date || '').localeCompare(a.last_date || ''));
+
+    // Deduplicate by ship name.
+    // Score each copy: newer is better, shallower path depth is better (local
+    // working copies live closer to ~ than deep cache hierarchies).
+    // --raw skips this and returns everything for smart callers.
+    if (!options.raw) {
+      const merged = new Map();
+      for (const r of active) {
+        const key = r.ship;
+        const score = _dedupScore(r, searchPath);
+
+        if (!merged.has(key)) {
+          r._score = score;
+          merged.set(key, r);
+        } else {
+          const existing = merged.get(key);
+          if (score > existing._score) {
+            r.entries_recent = Math.max(r.entries_recent, existing.entries_recent);
+            r.entries_total = Math.max(r.entries_total, existing.entries_total);
+            r._score = score;
+            merged.set(key, r);
+          } else {
+            existing.entries_recent = Math.max(r.entries_recent, existing.entries_recent);
+            existing.entries_total = Math.max(r.entries_total, existing.entries_total);
+          }
+        }
+      }
+      active.length = 0;
+      for (const r of merged.values()) {
+        delete r._score;
+        active.push(r);
+      }
+      active.sort((a, b) => (b.last_date || '').localeCompare(a.last_date || ''));
+    }
 
     if (jsonOutput) {
       console.log(JSON.stringify({ days, active_repos: active.length, repos: active }, null, 2));
@@ -335,6 +468,12 @@ function captainslogActive(options) {
     active.forEach(r => {
       const marker = r.last_impact === 'high' ? '★' : ' ';
       console.log(`${marker} ${r.ship}`);
+      if (r.location) {
+        console.log(`  Path: ${r.location}`);
+      }
+      if (r.tags && r.tags.length > 0) {
+        console.log(`  Tags: ${r.tags.join(', ')}`);
+      }
       console.log(`  Last: ${r.last_date} — ${r.last_title}`);
       console.log(`  Entries: ${r.entries_recent} recent / ${r.entries_total} total`);
       if (r.topics.length > 0) {
@@ -506,63 +645,119 @@ function terminalNote(text, options) {
 // ============================================================================
 
 function searchAll(query, options) {
-  const searchPath = options.path || process.cwd();
-
-  // Build grep pattern for Greek char files
-  const greekPattern = GREEK_CHARS.map(char => `${char}*.md`).join('|');
+  const { searchPath, scope } = resolveSearchPath(options);
+  const jsonOutput = options.json || false;
+  const showLocations = options.locations || false;
+  const queryLower = query.toLowerCase();
 
   try {
-    let rgCommand = `rg -l "${query}"`;
-
-    // Add file pattern for Greek char files
+    const { spawnSync } = require('child_process');
+    const args = ['-l', query, '-i'];
     GREEK_CHARS.forEach(char => {
-      rgCommand += ` -g "${char}*.md"`;
+      args.push('-g', `${char}*.md`);
     });
+    if (scope === 'here') {
+      args.push('--max-depth', '1');
+    }
+    if (scope === 'all') {
+      args.push('--hidden');
+      for (const dir of SKIP_DIRS) {
+        args.push('-g', `!${dir}`);
+      }
+    }
+    args.push(searchPath);
 
-    rgCommand += ` "${searchPath}"`;
-
-    const output = execSync(rgCommand, { encoding: 'utf8' });
-    const files = output.trim().split('\n').filter(Boolean);
+    const result = spawnSync('rg', args, { encoding: 'utf8', timeout: 10000 });
+    const files = (result.stdout || '').trim().split('\n').filter(Boolean);
 
     if (files.length === 0) {
-      console.log(`No results found for: ${query}`);
+      if (jsonOutput) {
+        console.log(JSON.stringify({ query, results: [] }));
+      } else {
+        console.log(`No results found for: ${query}`);
+      }
       return;
     }
 
-    console.log(`\nFound "${query}" in ${files.length} file(s):\n`);
+    const results = [];
 
     files.forEach(file => {
       const parsed = readMetadataFile(file);
       if (!parsed) return;
 
       const relPath = path.relative(searchPath, file);
-      console.log(`${relPath}:`);
+      const basename = path.basename(file);
+      const dir = path.dirname(file);
 
-      // Show relevant data
-      if (parsed.data.tags && parsed.data.tags.includes(query)) {
-        console.log(`  Tags: ${parsed.data.tags.join(', ')}`);
-      }
-      if (parsed.data.topics && parsed.data.topics.includes(query)) {
-        console.log(`  Topics: ${parsed.data.topics.join(', ')}`);
-      }
-      if (parsed.data.fleets) {
-        const matchingFleet = parsed.data.fleets.find(f => f.name.includes(query));
-        if (matchingFleet) {
-          console.log(`  Fleet: ${matchingFleet.name} (Rank: ${matchingFleet.rank})`);
-        }
+      const entry = {
+        file: relPath,
+        location: showLocations ? file : undefined,
+      };
+
+      // For captain's logs: extract matching entries with dates
+      if (basename === CAPTAINSLOG_FILE && parsed.data.entries) {
+        const ship = parsed.data.ship || path.basename(dir);
+        const allEntries = ensureArray(parsed.data.entries);
+        const matching = allEntries.filter(e => {
+          const text = [e.title || '', e.type || '', e.content || ''].join(' ').toLowerCase();
+          return text.includes(queryLower);
+        });
+        // If no entries match by content, the query matched in the markdown body
+        // Still return the most recent entries as context
+        const relevant = matching.length > 0 ? matching : allEntries.slice(0, 3);
+        entry.ship = ship;
+        entry.type = 'captainslog';
+        entry.matching_entries = relevant.slice(0, 10).map(e => ({
+          date: e.date || '',
+          type: e.type || '',
+          impact: e.impact || '',
+          title: e.title || '',
+        }));
+        entry.total_matches = matching.length;
+      } else {
+        // For other Greek files: return tags, topics, fleets
+        entry.type = basename.replace('.md', '');
+        if (parsed.data.tags) entry.tags = ensureArray(parsed.data.tags);
+        if (parsed.data.topics) entry.topics = ensureArray(parsed.data.topics);
+        if (parsed.data.shipname) entry.ship = parsed.data.shipname;
       }
 
+      results.push(entry);
+    });
+
+    // Sort: captain's logs first (most useful), then by date
+    results.sort((a, b) => {
+      if (a.type === 'captainslog' && b.type !== 'captainslog') return -1;
+      if (b.type === 'captainslog' && a.type !== 'captainslog') return 1;
+      const aDate = (a.matching_entries || [])[0]?.date || '';
+      const bDate = (b.matching_entries || [])[0]?.date || '';
+      return bDate.localeCompare(aDate);
+    });
+
+    if (jsonOutput) {
+      console.log(JSON.stringify({ query, results }, null, 2));
+      return;
+    }
+
+    console.log(`\nFound "${query}" in ${results.length} file(s):\n`);
+    results.forEach(r => {
+      console.log(`${r.file}:`);
+      if (r.location) console.log(`  Path: ${r.location}`);
+      if (r.ship) console.log(`  Ship: ${r.ship}`);
+      if (r.matching_entries) {
+        r.matching_entries.forEach(e => {
+          const marker = e.impact === 'high' ? '★' : ' ';
+          console.log(`  ${marker} ${e.date} [${e.type}] ${e.title}`);
+        });
+      }
+      if (r.tags) console.log(`  Tags: ${r.tags.join(', ')}`);
+      if (r.topics) console.log(`  Topics: ${r.topics.join(', ')}`);
       console.log('');
     });
 
   } catch (error) {
-    if (error.status === 1) {
-      console.log(`No results found for: ${query}`);
-    } else {
-      console.error('Error running search:', error.message);
-      console.error('Make sure ripgrep (rg) is installed on your system.');
-      process.exit(1);
-    }
+    console.error('Error running search:', error.message);
+    process.exit(1);
   }
 }
 
@@ -658,7 +853,7 @@ if (require.main === module) {
   program
     .name('tagsidecar')
     .description('Sidecar metadata file management for developers who work in frenzies')
-    .version('1.1.0');
+    .version('1.2.0');
 
   // SHIP COMMANDS
   const ship = program.command('ship').description('Ship metadata operations');
@@ -727,8 +922,13 @@ if (require.main === module) {
   captainslog
     .command('active')
     .description('Show repos with recent captain\'s log activity')
-    .option('-p, --path <path>', 'Search path (default: current directory)')
+    .option('-s, --scope <scope>', 'Search scope: here (cwd only), tree (cwd recursive, default), all (home dir)')
+    .option('-p, --path <path>', 'Explicit search path (overrides --scope)')
     .option('-d, --days <days>', 'Look back this many days (default: 30)')
+    .option('--tag <tags>', 'Filter to repos with this tag (comma-separated)')
+    .option('--detail <n>', 'Show last N entries per repo (default: 1)')
+    .option('--locations', 'Include file paths in output')
+    .option('--raw', 'Skip dedup — return all copies (for callers that do their own merging)')
     .option('--json', 'Output as JSON for programmatic use')
     .action(captainslogActive);
 
@@ -798,8 +998,11 @@ if (require.main === module) {
   // SEARCH COMMAND
   program
     .command('search <query>')
-    .description('Search across all Greek char .md files')
-    .option('-p, --path <path>', 'Search path (default: current directory)')
+    .description('Search across all Greek char .md files — returns matching entries with dates')
+    .option('-s, --scope <scope>', 'Search scope: here (cwd only), tree (cwd recursive, default), all (home dir)')
+    .option('-p, --path <path>', 'Explicit search path (overrides --scope)')
+    .option('--locations', 'Include file paths in output')
+    .option('--json', 'Output as JSON for programmatic use')
     .action(searchAll);
 
   // DISCOVER COMMAND
